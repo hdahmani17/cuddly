@@ -1,0 +1,142 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.24;
+
+import {BaseHook} from "v4-periphery/src/BaseHook.sol";
+import {Hooks} from "v4-core/src/libraries/Hooks.sol";
+import {IPoolManager} from "v4-core/src/interfaces/IPoolManager.sol";
+import {PoolKey} from "v4-core/src/types/PoolKey.sol";
+import {PoolId, PoolIdLibrary} from "v4-core/src/types/PoolId.sol";
+import {ModifyLiquidityParams} from "v4-core/src/types/ModifyLiquidityParams.sol";
+import {BalanceDelta} from "v4-core/src/types/BalanceDelta.sol";
+import {IERC20} from "openzeppelin-contracts/contracts/token/ERC20/IERC20.sol";
+
+contract LiquidityLockHook is BaseHook {
+    using PoolIdLibrary for PoolKey;
+
+    /// @notice Mapping poolId -> timestamp de déblocage
+    mapping(PoolId => uint256) public liquidityUnlockTimestamps;
+    
+    /// @notice Événements pour tracking
+    event LiquidityLocked(PoolId indexed poolId, uint256 unlockTimestamp);
+    event LiquidityUnlocked(PoolId indexed poolId);
+
+    constructor(IPoolManager _poolManager) BaseHook(_poolManager) {}
+
+    /// @notice Retourne les flags de hooks activés (avant suppression de liquidité uniquement)
+    function getHookPermissions() public pure override returns (Hooks.Permissions memory) {
+        return Hooks.Permissions({
+            beforeInitialize: false,
+            afterInitialize: false,
+            beforeAddLiquidity: false,
+            afterAddLiquidity: false,
+            beforeRemoveLiquidity: true,
+            afterRemoveLiquidity: false,
+            beforeSwap: false,
+            afterSwap: false,
+            beforeDonate: false,
+            afterDonate: false,
+            beforeSwapReturnDelta: false,
+            afterSwapReturnDelta: false,
+            afterAddLiquidityReturnDelta: false,
+            afterRemoveLiquidityReturnDelta: false
+        });
+    }
+
+    /// @notice Bloque la liquidité pour une date donnée (appelé lors de l'initialisation du pool)
+    function setLiquidityLock(PoolKey calldata key, uint256 unlockTimestamp) external {
+        require(msg.sender == address(this.poolManager), "Unauthorized");
+        PoolId poolId = key.toId();
+        require(unlockTimestamp > block.timestamp, "Invalid unlock timestamp");
+        liquidityUnlockTimestamps[poolId] = unlockTimestamp;
+        emit LiquidityLocked(poolId, unlockTimestamp);
+    }
+
+    /// @notice Hook déclenché AVANT suppression de liquidité - BLOQUE si date pas atteinte
+    function beforeRemoveLiquidity(
+        address,
+        PoolKey calldata key,
+        IPoolManager.ModifyLiquidityParams calldata,
+        bytes calldata
+    ) external override onlyPoolManager returns (bytes4) {
+        PoolId poolId = key.toId();
+        uint256 unlockTime = liquidityUnlockTimestamps[poolId];
+        
+        // Si pas de lock ou date atteinte → autorise
+        if (unlockTime == 0 || block.timestamp >= unlockTime) {
+            if (unlockTime > 0) {
+                delete liquidityUnlockTimestamps[poolId];
+                emit LiquidityUnlocked(poolId);
+            }
+            return BaseHook.beforeRemoveLiquidity.selector;
+        }
+        
+        // BLOQUE la suppression de liquidité
+        revert LiquidityLockedUntil(unlockTime);
+    }
+
+    /// @dev Custom error pour gas efficiency
+    error LiquidityLockedUntil(uint256 unlockTimestamp);
+}
+[profile.default]
+src = "src"
+out = "out"
+libs = ["lib"]
+remappings = [
+    "v4-core/=lib/v4-core/src/",
+    "v4-periphery/=lib/v4-periphery/src/",
+    "openzeppelin-contracts/=lib/openzeppelin-contracts/contracts/"
+]
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.24;
+
+import {Script, console} from "forge-std/Script.sol";
+import {LiquidityLockHook} from "../src/LiquidityLockHook.sol";
+import {PoolManager} from "v4-core/src/PoolManager.sol";
+
+contract DeployHook is Script {
+    function run() external {
+        uint256 deployerPrivateKey = vm.envUint("PRIVATE_KEY");
+        vm.startBroadcast(deployerPrivateKey);
+        
+        // Déployer le hook
+        IPoolManager poolManager = IPoolManager(0x...); // Adresse PoolManager mainnet
+        LiquidityLockHook hook = new LiquidityLockHook(poolManager);
+        
+        console.log("Hook déployé:", address(hook));
+        vm.stopBroadcast();
+    }
+}
+// SPDX-License-Identifier: UNLICENSED
+pragma solidity ^0.8.24;
+
+import {Test, console2} from "forge-std/Test.sol";
+import {LiquidityLockHook} from "../src/LiquidityLockHook.sol";
+// Imports Uniswap V4 + tokens de test...
+
+contract LiquidityLockHookTest is Test {
+    LiquidityLockHook hook;
+    
+    function setUp() public {
+        // Fork + setup Uniswap V4 test environment
+        vm.createSelectFork("mainnet");
+        // Déployer PoolManager, tokens, etc.
+    }
+    
+    function testLiquidityLock() public {
+        // 1. Créer pool avec hook
+        uint256 unlockTimestamp = block.timestamp + 7 days;
+        
+        // 2. Ajouter liquidité
+        // vm.prank(LP);
+        // addLiquidity(...)
+        
+        // 3. Tenter retrait AVANT → REVERT
+        vm.warp(block.timestamp + 1 days);
+        vm.expectRevert(LiquidityLockHook.LiquidityLockedUntil.selector);
+        // removeLiquidity();
+        
+        // 4. Tenter retrait APRÈS → SUCCESS
+        vm.warp(unlockTimestamp + 1);
+        // removeLiquidity(); // Doit passer
+    }
+}
